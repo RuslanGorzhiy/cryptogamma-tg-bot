@@ -16,6 +16,13 @@
 
 Опционально:
     ALERT_ASSETS — список активов через запятую, по умолчанию "BTC,ETH"
+
+Между запусками скрипт хранит короткий снимок ключевых метрик в
+state/last_snapshot.json (см. state_store.py) — это нужно, чтобы
+считать динамику (разворот dealer bias, рост/падение Net GEX и
+C/P ratio), а не оценивать сигнал по одной изолированной точке. В
+GitHub Actions файл нужно закоммитить обратно в репозиторий — это
+делает последний шаг в .github/workflows/alert.yml.
 """
 
 from __future__ import annotations
@@ -27,7 +34,8 @@ import sys
 import requests
 
 from cryptogamma_client import CryptoGammaError, fetch_snapshot
-from signals import format_snapshot_message
+from signals import format_snapshot_message, trackable_fields
+from state_store import load_previous, save_previous
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -67,7 +75,12 @@ def main() -> int:
     for asset in assets:
         try:
             snap = fetch_snapshot(asset)
-            text = format_snapshot_message(snap)
+            previous = load_previous(asset)
+            text = format_snapshot_message(snap, previous=previous)
+            # Сохраняем состояние сразу после успешного получения данных —
+            # даже если отправка в Telegram ниже не удастся, динамика
+            # между снимками не потеряется на следующем запуске.
+            save_previous(asset, trackable_fields(snap))
             send_telegram_message(token, chat_id, text)
             logger.info("Отправлен алерт по %s", asset)
         except CryptoGammaError as exc:
