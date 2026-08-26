@@ -4,8 +4,7 @@ Telegram-бот для BTC и ETH на основе публичных данн�
 [cryptogamma.io](https://cryptogamma.io/dashboard/) (Gamma Exposure,
 dealer bias, squeeze levels, IV/RV, flow, put/call ratio).
 
-Данные берутся из **публичного JSON snapshot API** cryptogamma.io,
-без токена и авторизации:
+Данные берутся из JSON snapshot API cryptogamma.io:
 
 ```
 GET https://cryptogamma.io/api/public/snapshot?asset=BTC
@@ -14,6 +13,19 @@ GET https://cryptogamma.io/api/public/snapshot?asset=ETH
 
 Источник данных на самом cryptogamma.io — публичное Deribit options
 API, обновление раз в ~15 минут.
+
+> ⚠️ **Требуется API-токен.** Ранее этот эндпоинт отдавал JSON без
+> авторизации, но сейчас cryptogamma.io закрыл анонимный доступ и
+> возвращает `401 Unauthorized` без токена. Получить бесплатный токен
+> можно на [cryptogamma.io/api-docs](https://cryptogamma.io/api-docs/),
+> войдя через Google-аккаунт. Точный формат передачи токена на странице
+> не задокументирован открытым текстом — после логина проверьте
+> вкладку **Network** в DevTools браузера при обращении дашборда к API
+> (заголовок `Authorization: Bearer ...` либо `X-API-Key: ...`).
+>
+> Полученный токен задайте в переменной окружения
+> `CRYPTOGAMMA_API_TOKEN`. Если сайт использует не `Bearer`, а
+> `X-API-Key`, дополнительно задайте `CRYPTOGAMMA_AUTH_SCHEME=apikey`.
 
 ## Два режима работы
 
@@ -49,6 +61,7 @@ python bot.py
 2. В настройках репозитория: **Settings → Secrets and variables → Actions → New repository secret** — добавьте:
    - `TELEGRAM_BOT_TOKEN` — токен бота
    - `TELEGRAM_CHAT_ID` — id чата/канала, куда слать алерты
+   - `CRYPTOGAMMA_API_TOKEN` — токен, полученный на cryptogamma.io/api-docs (см. предупреждение выше)
 3. Узнать `TELEGRAM_CHAT_ID`: напишите боту любое сообщение, затем откройте
    `https://api.telegram.org/bot<ТОКЕН>/getUpdates` и найдите `"chat":{"id": ...}`.
    Для канала — добавьте бота администратором и используйте id канала (обычно начинается с `-100`).
@@ -61,12 +74,29 @@ cryptogamma-tg-bot/
 ├── bot.py                  # интерактивный бот (long polling)
 ├── alert.py                # разовый скрипт для расписания (GitHub Actions)
 ├── cryptogamma_client.py   # клиент публичного API cryptogamma.io
-├── signals.py              # форматирование сообщений и простых сигналов
+├── signals.py              # форматирование сообщений, сигнал и его динамика
+├── state_store.py          # хранение снимка метрик между запусками (для динамики)
+├── state/last_snapshot.json # сам файл состояния (коммитится workflow'ом)
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
 └── .github/workflows/alert.yml
 ```
+
+## Динамика сигнала между снимками
+
+Сигнал не просто оценивает текущий снимок, но и сравнивает его с
+предыдущим (файл `state/last_snapshot.json`), чтобы учитывать:
+
+- разворот dealer bias (BEARISH → BULLISH и наоборот) — сильный сигнал
+- рост/падение Net GEX по сравнению с прошлым снимком
+- рост/падение put/call ratio
+
+Для `alert.py` в GitHub Actions последний шаг workflow коммитит
+обновлённый файл состояния обратно в репозиторий — без этого он бы
+терялся при каждом запуске, так как раннер каждый раз чистый. Для
+интерактивного бота (`bot.py`) состояние просто лежит на диске между
+вызовами команд в рамках одного запущенного процесса.
 
 ## Пример сообщения бота
 

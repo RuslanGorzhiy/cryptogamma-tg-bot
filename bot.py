@@ -25,7 +25,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from cryptogamma_client import CryptoGammaError, fetch_snapshot
-from signals import format_snapshot_message
+from signals import format_snapshot_message, trackable_fields
+from state_store import load_previous, save_previous
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -60,9 +61,15 @@ async def _send_asset(update: Update, asset: str) -> None:
         await update.message.reply_text(f"⚠️ Не удалось получить данные по {asset}: {exc}")
         return
 
-    await update.message.reply_text(
-        format_snapshot_message(snap), parse_mode=ParseMode.HTML, disable_web_page_preview=True
-    )
+    # Динамика между запросами: используем тот же файл состояния, что и
+    # alert.py (state/last_snapshot.json), поэтому картина согласована
+    # между интерактивным ботом и плановыми алертами, если они работают
+    # в общем рабочем каталоге.
+    previous = load_previous(asset)
+    text = format_snapshot_message(snap, previous=previous)
+    save_previous(asset, trackable_fields(snap))
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

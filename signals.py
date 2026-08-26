@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from cryptogamma_client import GammaSnapshot
 
@@ -57,13 +57,43 @@ def derive_squeeze_note(snap: GammaSnapshot) -> str:
 
 @dataclass
 class OverallSignal:
-    """Итоговый составной сигнал: направление + сила + обоснование."""
+    """Итоговый составной сигнал: направление + сила + уверенность + обоснование."""
 
     label: str          # "БЫЧИЙ" / "МЕДВЕЖИЙ" / "НЕЙТРАЛЬНЫЙ"
     emoji: str           # 🟢 / 🔴 / ⚪️
     strength: str        # "сильный" / "умеренный" / "слабый"
+    confidence: str       # "высокая" / "средняя" / "низкая" / "н/д"
+    confidence_note: str  # короткое пояснение, откуда взялась уверенность
     score: float          # итоговый взвешенный балл, для отладки/сортировки
     reasons: List[str] = field(default_factory=list)
+
+
+def derive_confidence(snap: GammaSnapshot) -> Tuple[str, str]:
+    """Оценивает уверенность в направлении сигнала на основе IV/RV.
+
+    Vol premium (IV минус RV) сам по себе не задаёт направление, но
+    задаёт контекст: если рынок закладывает в цену опционов заметно
+    больше волатильности, чем реализуется по факту, это означает, что
+    участники ждут заметного движения/новостей — и любой направленный
+    сигнал в такой момент менее надёжен, потому что дилерский хедж и
+    squeeze-уровни легче ломаются резким импульсом.
+
+    Если явного vol_premium нет, но есть IV и RV по отдельности — премия
+    считается как их разница.
+    """
+    premium = snap.vol_premium
+    if premium is None and snap.iv_atm is not None and snap.realized_vol is not None:
+        premium = snap.iv_atm - snap.realized_vol
+
+    if premium is None:
+        return "н/д", "нет данных по IV/RV для оценки уверенности"
+
+    abs_premium = abs(premium)
+    if abs_premium <= 5:
+        return "высокая", f"IV и RV близки (премия {premium:+.1f}%), рынок не закладывает сюрприз"
+    if abs_premium <= 15:
+        return "средняя", f"умеренная премия волатильности ({premium:+.1f}%)"
+    return "низкая", f"высокая премия волатильности ({premium:+.1f}%) — рынок ждёт заметное движение"
 
 
 # Веса компонентов итогового сигнала. Каждый компонент даёт вклад от -1
@@ -74,14 +104,41 @@ _WEIGHTS = {
     "level_position": 1.5,
     "flow": 1.5,
     "put_call_ratio": 1.0,
+    "bias_flip": 2.0,        # разворот dealer bias между снимками — сильный сигнал
+    "momentum_net_gamma": 1.0,
+    "momentum_put_call": 1.0,
 }
 
 
-def derive_overall_signal(snap: GammaSnapshot) -> OverallSignal:
+def trackable_fields(snap: GammaSnapshot) -> dict:
+    """Небольшой словарь ключевых метрик снимка для сохранения между запусками.
+
+    Используется state_store.py, чтобы на следующем запуске можно было
+    посчитать дельту/разворот метрик, а не оценивать сигнал по одной
+    изолированной точке.
+    """
+    return {
+        "price": snap.price,
+        "net_gamma": snap.net_gamma,
+        "dealer_bias": snap.dealer_bias,
+        "put_call_ratio": snap.put_call_ratio,
+        "iv_atm": snap.iv_atm,
+        "realized_vol": snap.realized_vol,
+        "vol_premium": snap.vol_premium,
+        "updated_at": snap.updated_at,
+    }
+
+
+def derive_overall_signal(snap: GammaSnapshot, previous: Optional[dict] = None) -> OverallSignal:
     """Считает составной бычий/медвежий/нейтральный сигнал.
 
     Комбинирует dealer bias, знак Net GEX, положение цены относительно
-    squeeze-уровней, флоу коллов/путов за 24ч и put/call ratio.
+    squeeze-уровней, флоу коллов/путов за 24ч, put/call ratio, а также,
+    если передан предыдущий снимок (см. state_store.py), динамику
+    между снимками: разворот dealer bias и направление изменения Net GEX
+    и C/P ratio. Разворот метрики часто значимее её текущего абсолютного
+    значения.
+
     Это упрощённая эвристика поверх метрик cryptogamma.io, а не
     самостоятельный количественный сигнал — она не учитывает контекст
     рынка вне опционных данных и не является финансовым советом.
@@ -156,11 +213,54 @@ def derive_overall_signal(snap: GammaSnapshot) -> OverallSignal:
             reasons.append(f"C/P ratio низкий ({snap.put_call_ratio:.2f})")
         max_possible += _WEIGHTS["put_call_ratio"]
 
+    # 6. Динамика между снимками (если есть предыдущий снимок).
+    if previous:
+        prev_bias = (previous.get("dealer_bias") or "").upper()
+        cur_bias_norm = bias
+        prev_is_directional = "BULL" in prev_bias or "BEAR" in prev_bias
+        cur_is_directional = "BULL" in cur_bias_norm or "BEAR" in cur_bias_norm
+        if prev_is_directional and cur_is_directional and prev_bias != cur_bias_norm:
+            if "BULL" in cur_bias_norm:
+                score += _WEIGHTS["bias_flip"]
+                reasons.append(f"⚡ Dealer bias развернулся: {prev_bias} → {cur_bias_norm}")
+            else:
+                score -= _WEIGHTS["bias_flip"]
+                reasons.append(f"⚡ Dealer bias развернулся: {prev_bias} → {cur_bias_norm}")
+            max_possible += _WEIGHTS["bias_flip"]
+
+        prev_net_gamma = previous.get("net_gamma")
+        if prev_net_gamma is not None and snap.net_gamma is not None:
+            delta = snap.net_gamma - prev_net_gamma
+            # Порог, чтобы не реагировать на шум округления.
+            if abs(delta) > abs(prev_net_gamma) * 0.02 + 1:
+                if delta > 0:
+                    score += _WEIGHTS["momentum_net_gamma"]
+                    reasons.append("Net GEX растёт по сравнению с прошлым снимком")
+                else:
+                    score -= _WEIGHTS["momentum_net_gamma"]
+                    reasons.append("Net GEX снижается по сравнению с прошлым снимком")
+                max_possible += _WEIGHTS["momentum_net_gamma"]
+
+        prev_ratio = previous.get("put_call_ratio")
+        if prev_ratio is not None and snap.put_call_ratio is not None and prev_ratio > 0:
+            delta_ratio = snap.put_call_ratio - prev_ratio
+            if abs(delta_ratio) > 0.03:
+                if delta_ratio < 0:
+                    score += _WEIGHTS["momentum_put_call"]
+                    reasons.append("C/P ratio снижается (сдвиг к коллам)")
+                else:
+                    score -= _WEIGHTS["momentum_put_call"]
+                    reasons.append("C/P ratio растёт (сдвиг к путам)")
+                max_possible += _WEIGHTS["momentum_put_call"]
+
     if max_possible == 0:
+        confidence, confidence_note = derive_confidence(snap)
         return OverallSignal(
             label="НЕЙТРАЛЬНЫЙ",
             emoji="⚪️",
             strength="н/д",
+            confidence=confidence,
+            confidence_note=confidence_note,
             score=0.0,
             reasons=["Недостаточно данных для расчёта сигнала"],
         )
@@ -178,18 +278,31 @@ def derive_overall_signal(snap: GammaSnapshot) -> OverallSignal:
     else:
         label, emoji, strength = "НЕЙТРАЛЬНЫЙ", "⚪️", "слабый"
 
-    return OverallSignal(label=label, emoji=emoji, strength=strength, score=normalized, reasons=reasons)
+    confidence, confidence_note = derive_confidence(snap)
+
+    return OverallSignal(
+        label=label,
+        emoji=emoji,
+        strength=strength,
+        confidence=confidence,
+        confidence_note=confidence_note,
+        score=normalized,
+        reasons=reasons,
+    )
 
 
-def format_snapshot_message(snap: GammaSnapshot) -> str:
-    overall = derive_overall_signal(snap)
+def format_snapshot_message(snap: GammaSnapshot, previous: Optional[dict] = None) -> str:
+    overall = derive_overall_signal(snap, previous=previous)
     bias_emoji = derive_bias_emoji(snap)
 
     lines = [
-        f"{overall.emoji} <b>{snap.asset}: {overall.label} сигнал</b> ({overall.strength})",
+        f"{overall.emoji} <b>{snap.asset}: {overall.label} сигнал</b> "
+        f"({overall.strength}, уверенность: {overall.confidence})",
     ]
     if overall.reasons:
         lines.append("<i>" + "; ".join(overall.reasons) + "</i>")
+    if overall.confidence_note:
+        lines.append(f"<i>Уверенность: {overall.confidence_note}</i>")
     lines += [
         "",
         f"{bias_emoji} <b>Gamma Exposure (cryptogamma.io)</b>",
