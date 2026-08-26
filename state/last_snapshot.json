@@ -1,0 +1,22 @@
+{
+  "BTC": {
+    "price": null,
+    "net_gamma": null,
+    "dealer_bias": null,
+    "put_call_ratio": null,
+    "iv_atm": null,
+    "realized_vol": null,
+    "vol_premium": null,
+    "updated_at": null
+  },
+  "ETH": {
+    "price": null,
+    "net_gamma": null,
+    "dealer_bias": null,
+    "put_call_ratio": null,
+    "iv_atm": null,
+    "realized_vol": null,
+    "vol_premium": null,
+    "updated_at": null
+  }
+}
