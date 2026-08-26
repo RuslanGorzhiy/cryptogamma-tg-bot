@@ -150,9 +150,27 @@ def _auth_headers() -> dict:
     """
     token = os.environ.get("CRYPTOGAMMA_API_TOKEN")
     if not token:
+        logger.warning(
+            "CRYPTOGAMMA_API_TOKEN не задан или пуст — запрос уйдёт без авторизации "
+            "и почти наверняка получит 401."
+        )
         return {}
 
+    # Частые ошибки при копировании токена в GitHub Secret: обрамляющие
+    # кавычки, случайные пробелы/переносы строк, или токен уже вставлен
+    # вместе со словом "Bearer".
+    token = token.strip().strip('"').strip("'")
+    if token.lower().startswith("bearer "):
+        token = token[len("bearer "):].strip()
+
     scheme = os.environ.get("CRYPTOGAMMA_AUTH_SCHEME", "bearer").strip().lower()
+    logger.info(
+        "Использую токен cryptogamma.io (длина=%d, схема=%s, начало=%s...)",
+        len(token),
+        scheme,
+        token[:4] if len(token) >= 4 else "??",
+    )
+
     if scheme == "apikey":
         return {"X-API-Key": token}
     return {"Authorization": f"Bearer {token}"}
