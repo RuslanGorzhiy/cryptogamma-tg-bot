@@ -3,7 +3,7 @@ name: CryptoGamma Telegram Alert
 on:
   schedule:
     # каждые 30 минут (UTC). Измените под свои нужды.
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
 permissions:
