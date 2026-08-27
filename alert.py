@@ -3,7 +3,9 @@
 
 В отличие от bot.py (постоянный long-polling процесс, требующий
 всегда работающего сервера), этот скрипт:
-    1. один раз запрашивает снимки по BTC и ETH,
+    1. один раз запрашивает снимки по BTC и ETH с cryptogamma.io,
+       Binance (RSI/EMA, funding rate, open interest) и Fear & Greed
+       Index,
     2. отправляет сообщение в заданный Telegram chat_id через
        Bot API sendMessage,
     3. завершает работу.
@@ -17,12 +19,15 @@
 Опционально:
     ALERT_ASSETS — список активов через запятую, по умолчанию "BTC,ETH"
 
+Binance и Fear & Greed Index — публичные API без ключей, дополнительные
+переменные окружения для них не нужны.
+
 Между запусками скрипт хранит короткий снимок ключевых метрик в
 state/last_snapshot.json (см. state_store.py) — это нужно, чтобы
 считать динамику (разворот dealer bias, рост/падение Net GEX и
-C/P ratio), а не оценивать сигнал по одной изолированной точке. В
-GitHub Actions файл нужно закоммитить обратно в репозиторий — это
-делает последний шаг в .github/workflows/alert.yml.
+C/P ratio, матрицу цена×OI), а не оценивать сигнал по одной
+изолированной точке. В GitHub Actions файл нужно закоммитить обратно
+в репозиторий — это делает последний шаг в .github/workflows/alert.yml.
 """
 
 from __future__ import annotations
@@ -34,6 +39,8 @@ import sys
 import requests
 
 from cryptogamma_client import CryptoGammaError, fetch_snapshot
+from feargreed_client import fetch_fear_greed
+from market_data import fetch_market_context
 from signals import format_snapshot_message, trackable_fields
 from state_store import load_previous, save_previous
 
@@ -71,16 +78,21 @@ def main() -> int:
 
     assets = [a.strip().upper() for a in os.environ.get("ALERT_ASSETS", "BTC,ETH").split(",") if a.strip()]
 
+    # Fear & Greed Index общий для всего рынка — запрашиваем один раз на
+    # весь прогон, а не отдельно для BTC и ETH.
+    fear_greed = fetch_fear_greed()
+
     exit_code = 0
     for asset in assets:
         try:
             snap = fetch_snapshot(asset)
             previous = load_previous(asset)
-            text = format_snapshot_message(snap, previous=previous)
+            market = fetch_market_context(asset, fear_greed=fear_greed)
+            text = format_snapshot_message(snap, previous=previous, market=market)
             # Сохраняем состояние сразу после успешного получения данных —
             # даже если отправка в Telegram ниже не удастся, динамика
             # между снимками не потеряется на следующем запуске.
-            save_previous(asset, trackable_fields(snap))
+            save_previous(asset, trackable_fields(snap, market=market))
             send_telegram_message(token, chat_id, text)
             logger.info("Отправлен алерт по %s", asset)
         except CryptoGammaError as exc:
