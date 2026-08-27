@@ -10,14 +10,15 @@ from typing import List, Optional, Tuple
 from cryptogamma_client import GammaSnapshot
 
 
-def _fmt_num(value, suffix: str = "") -> str:
+def _fmt_num(value, suffix: str = "", show_sign: bool = False) -> str:
     if value is None:
         return "н/д"
+    sign = "+" if (show_sign and value > 0) else ""
     if abs(value) >= 1_000_000:
-        return f"{value / 1_000_000:.2f}M{suffix}"
+        return f"{sign}{value / 1_000_000:.2f}M{suffix}"
     if abs(value) >= 1_000:
-        return f"{value / 1_000:.2f}K{suffix}"
-    return f"{value:.2f}{suffix}"
+        return f"{sign}{value / 1_000:.2f}K{suffix}"
+    return f"{sign}{value:.2f}{suffix}"
 
 
 def _fmt_price(value) -> str:
@@ -308,8 +309,8 @@ def format_snapshot_message(snap: GammaSnapshot, previous: Optional[dict] = None
         f"{bias_emoji} <b>Gamma Exposure (cryptogamma.io)</b>",
         "",
         f"Цена: <b>{_fmt_price(snap.price)}</b>",
-        f"Net GEX: <b>{_fmt_num(snap.net_gamma)}</b> "
-        f"(Call {_fmt_num(snap.call_gamma)} / Put {_fmt_num(snap.put_gamma)})",
+        f"Net GEX: <b>{_fmt_num(snap.net_gamma, show_sign=True)}</b> "
+        f"(Call {_fmt_num(snap.call_gamma, show_sign=True)} / Put {_fmt_num(snap.put_gamma, show_sign=True)})",
         f"Dealer bias: <b>{snap.dealer_bias or 'н/д'}</b>"
         + (f" ({_fmt_pct(snap.call_weighted_pct)} call-weighted)" if snap.call_weighted_pct else ""),
         "",
