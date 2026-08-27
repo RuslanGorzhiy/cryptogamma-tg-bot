@@ -7,7 +7,8 @@
     "iv_atm": null,
     "realized_vol": null,
     "vol_premium": null,
-    "updated_at": null
+    "updated_at": null,
+    "open_interest": null
   },
   "ETH": {
     "price": null,
@@ -17,6 +18,7 @@
     "iv_atm": null,
     "realized_vol": null,
     "vol_premium": null,
-    "updated_at": null
+    "updated_at": null,
+    "open_interest": null
   }
 }
