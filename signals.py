@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from cryptogamma_client import GammaSnapshot
+from market_data import MarketContext
 
 
 def _fmt_num(value, suffix: str = "", show_sign: bool = False) -> str:
@@ -108,15 +109,21 @@ _WEIGHTS = {
     "bias_flip": 2.0,        # разворот dealer bias между снимками — сильный сигнал
     "momentum_net_gamma": 1.0,
     "momentum_put_call": 1.0,
+    "rsi": 1.0,
+    "ema_trend": 1.5,
+    "funding_rate": 1.0,
+    "open_interest": 1.5,
+    "fear_greed": 1.0,
 }
 
 
-def trackable_fields(snap: GammaSnapshot) -> dict:
+def trackable_fields(snap: GammaSnapshot, market: Optional[MarketContext] = None) -> dict:
     """Небольшой словарь ключевых метрик снимка для сохранения между запусками.
 
     Используется state_store.py, чтобы на следующем запуске можно было
     посчитать дельту/разворот метрик, а не оценивать сигнал по одной
-    изолированной точке.
+    изолированной точке. Если передан MarketContext, дополнительно
+    сохраняется open interest — нужен для матрицы «цена × OI».
     """
     return {
         "price": snap.price,
@@ -127,22 +134,29 @@ def trackable_fields(snap: GammaSnapshot) -> dict:
         "realized_vol": snap.realized_vol,
         "vol_premium": snap.vol_premium,
         "updated_at": snap.updated_at,
+        "open_interest": market.open_interest if market else None,
     }
 
 
-def derive_overall_signal(snap: GammaSnapshot, previous: Optional[dict] = None) -> OverallSignal:
+def derive_overall_signal(
+    snap: GammaSnapshot,
+    previous: Optional[dict] = None,
+    market: Optional[MarketContext] = None,
+) -> OverallSignal:
     """Считает составной бычий/медвежий/нейтральный сигнал.
 
     Комбинирует dealer bias, знак Net GEX, положение цены относительно
-    squeeze-уровней, флоу коллов/путов за 24ч, put/call ratio, а также,
-    если передан предыдущий снимок (см. state_store.py), динамику
-    между снимками: разворот dealer bias и направление изменения Net GEX
-    и C/P ratio. Разворот метрики часто значимее её текущего абсолютного
-    значения.
+    squeeze-уровней, флоу коллов/путов за 24ч, put/call ratio, динамику
+    между снимками cryptogamma.io (если передан previous), а также,
+    если передан MarketContext (см. market_data.py), независимые
+    источники: RSI(14) и тренд по EMA20/EMA50 с Binance, funding rate и
+    открытый интерес по бессрочным фьючерсам, и Crypto Fear & Greed
+    Index. Это позволяет не полагаться только на опционные метрики
+    cryptogamma.io — funding/OI/RSI берутся с другого рынка (спот и
+    фьючерсы) и могут расходиться с ними, подсвечивая противоречия.
 
-    Это упрощённая эвристика поверх метрик cryptogamma.io, а не
-    самостоятельный количественный сигнал — она не учитывает контекст
-    рынка вне опционных данных и не является финансовым советом.
+    Это упрощённая эвристика, а не самостоятельный количественный
+    сигнал и не финансовый совет.
     """
     score = 0.0
     max_possible = 0.0
@@ -254,6 +268,90 @@ def derive_overall_signal(snap: GammaSnapshot, previous: Optional[dict] = None) 
                     reasons.append("C/P ratio растёт (сдвиг к путам)")
                 max_possible += _WEIGHTS["momentum_put_call"]
 
+    # 7. RSI(14) с Binance: контрарианская интерпретация на экстремумах,
+    # трендовая — в средней зоне.
+    if market and market.rsi14 is not None:
+        rsi = market.rsi14
+        if rsi >= 70:
+            score -= _WEIGHTS["rsi"]
+            reasons.append(f"RSI {rsi:.0f} — перекуплен (риск коррекции)")
+        elif rsi <= 30:
+            score += _WEIGHTS["rsi"]
+            reasons.append(f"RSI {rsi:.0f} — перепродан (потенциал отскока)")
+        else:
+            contrib = (rsi - 50) / 50
+            score += _WEIGHTS["rsi"] * contrib
+            if rsi > 55:
+                reasons.append(f"RSI {rsi:.0f} — бычий импульс")
+            elif rsi < 45:
+                reasons.append(f"RSI {rsi:.0f} — медвежий импульс")
+        max_possible += _WEIGHTS["rsi"]
+
+    # 8. Тренд по EMA20/EMA50 (Binance).
+    if market and market.ema20 is not None and market.ema50 is not None:
+        ref_price = market.binance_price if market.binance_price is not None else snap.price
+        if ref_price is not None:
+            if ref_price > market.ema20 > market.ema50:
+                score += _WEIGHTS["ema_trend"]
+                reasons.append("Цена выше EMA20 и EMA50 (растущий тренд)")
+            elif ref_price < market.ema20 < market.ema50:
+                score -= _WEIGHTS["ema_trend"]
+                reasons.append("Цена ниже EMA20 и EMA50 (падающий тренд)")
+            else:
+                reasons.append("EMA без чёткого тренда (цена между скользящими)")
+            max_possible += _WEIGHTS["ema_trend"]
+
+    # 9. Funding rate по бессрочным фьючерсам: экстремальные значения —
+    # контрарианский сигнал (рынок перегружен в одну сторону).
+    if market and market.funding_rate_pct is not None:
+        fr = market.funding_rate_pct
+        if fr > 0.05:
+            score -= _WEIGHTS["funding_rate"]
+            reasons.append(f"Funding rate высокий ({fr:+.3f}%) — перегрев лонгов")
+        elif fr < -0.02:
+            score += _WEIGHTS["funding_rate"]
+            reasons.append(f"Funding rate отрицательный ({fr:+.3f}%) — перегрев шортов")
+        max_possible += _WEIGHTS["funding_rate"]
+
+    # 10. Матрица «цена × открытый интерес» между прошлым и текущим снимком —
+    # классическая интерпретация фьючерсного OI.
+    if previous and market and market.open_interest is not None:
+        prev_oi = previous.get("open_interest")
+        prev_price = previous.get("price")
+        if prev_oi is not None and prev_price and snap.price is not None:
+            oi_rising = market.open_interest > prev_oi * 1.01
+            oi_falling = market.open_interest < prev_oi * 0.99
+            price_rising = snap.price > prev_price * 1.001
+            price_falling = snap.price < prev_price * 0.999
+
+            if price_rising and oi_rising:
+                score += _WEIGHTS["open_interest"]
+                reasons.append("Цена и OI растут вместе (новые лонги подтверждают тренд)")
+                max_possible += _WEIGHTS["open_interest"]
+            elif price_falling and oi_rising:
+                score -= _WEIGHTS["open_interest"]
+                reasons.append("Цена падает при росте OI (новые шорты подтверждают снижение)")
+                max_possible += _WEIGHTS["open_interest"]
+            elif price_rising and oi_falling:
+                score += _WEIGHTS["open_interest"] * 0.3
+                reasons.append("Цена растёт при падении OI (шорт-сквиз, тренд может быть слабее)")
+                max_possible += _WEIGHTS["open_interest"]
+            elif price_falling and oi_falling:
+                score += _WEIGHTS["open_interest"] * 0.2
+                reasons.append("Цена падает при падении OI (закрытие лонгов, возможное истощение)")
+                max_possible += _WEIGHTS["open_interest"]
+
+    # 11. Crypto Fear & Greed Index — общий по рынку, контрарианская трактовка.
+    if market and market.fear_greed_value is not None:
+        fg = market.fear_greed_value
+        if fg >= 75:
+            score -= _WEIGHTS["fear_greed"]
+            reasons.append(f"Fear & Greed {fg} ({market.fear_greed_class}) — риск отката от жадности")
+        elif fg <= 25:
+            score += _WEIGHTS["fear_greed"]
+            reasons.append(f"Fear & Greed {fg} ({market.fear_greed_class}) — потенциал разворота от страха")
+        max_possible += _WEIGHTS["fear_greed"]
+
     if max_possible == 0:
         confidence, confidence_note = derive_confidence(snap)
         return OverallSignal(
@@ -292,8 +390,12 @@ def derive_overall_signal(snap: GammaSnapshot, previous: Optional[dict] = None) 
     )
 
 
-def format_snapshot_message(snap: GammaSnapshot, previous: Optional[dict] = None) -> str:
-    overall = derive_overall_signal(snap, previous=previous)
+def format_snapshot_message(
+    snap: GammaSnapshot,
+    previous: Optional[dict] = None,
+    market: Optional[MarketContext] = None,
+) -> str:
+    overall = derive_overall_signal(snap, previous=previous, market=market)
     bias_emoji = derive_bias_emoji(snap)
 
     lines = [
@@ -333,9 +435,25 @@ def format_snapshot_message(snap: GammaSnapshot, previous: Optional[dict] = None
     if squeeze_note:
         lines += ["", squeeze_note]
 
+    if market and any(
+        v is not None
+        for v in (market.rsi14, market.ema20, market.funding_rate_pct, market.open_interest, market.fear_greed_value)
+    ):
+        lines += ["", "<b>Доп. источники (Binance / Fear&Greed):</b>"]
+        if market.rsi14 is not None:
+            lines.append(f"  RSI(14): {market.rsi14:.0f}")
+        if market.ema20 is not None and market.ema50 is not None:
+            lines.append(f"  EMA20/EMA50: {market.ema20:,.0f} / {market.ema50:,.0f}")
+        if market.funding_rate_pct is not None:
+            lines.append(f"  Funding rate: {market.funding_rate_pct:+.4f}%")
+        if market.open_interest is not None:
+            lines.append(f"  Open Interest: {_fmt_num(market.open_interest)}")
+        if market.fear_greed_value is not None:
+            lines.append(f"  Fear & Greed: {market.fear_greed_value} ({market.fear_greed_class or 'н/д'})")
+
     if snap.updated_at:
         lines += ["", f"<i>Обновлено: {snap.updated_at}</i>"]
 
-    lines += ["", "<i>Источник: cryptogamma.io (данные Deribit). Не является финансовым советом.</i>"]
+    lines += ["", "<i>Источники: cryptogamma.io (Deribit), Binance, alternative.me. Не является финансовым советом.</i>"]
 
     return "\n".join(lines)
