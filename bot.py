@@ -25,6 +25,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from cryptogamma_client import CryptoGammaError, fetch_snapshot
+from feargreed_client import fetch_fear_greed
+from market_data import fetch_market_context
 from signals import format_snapshot_message, trackable_fields
 from state_store import load_previous, save_previous
 
@@ -38,7 +40,8 @@ HELP_TEXT = (
     "👋 <b>CryptoGamma Signal Bot</b>\n\n"
     "Показывает метрики опционного Gamma Exposure (GEX) для BTC и ETH "
     "на основе данных <a href=\"https://cryptogamma.io\">cryptogamma.io</a> "
-    "(источник — Deribit).\n\n"
+    "(источник — Deribit), а также RSI/EMA, funding rate и открытый "
+    "интерес с Binance и Crypto Fear & Greed Index.\n\n"
     "<b>Команды:</b>\n"
     "/btc — снимок по Bitcoin\n"
     "/eth — снимок по Ethereum\n"
@@ -52,7 +55,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-async def _send_asset(update: Update, asset: str) -> None:
+async def _send_asset(update: Update, asset: str, fear_greed=None) -> None:
     await update.message.chat.send_action("typing")
     try:
         snap = fetch_snapshot(asset)
@@ -66,8 +69,9 @@ async def _send_asset(update: Update, asset: str) -> None:
     # между интерактивным ботом и плановыми алертами, если они работают
     # в общем рабочем каталоге.
     previous = load_previous(asset)
-    text = format_snapshot_message(snap, previous=previous)
-    save_previous(asset, trackable_fields(snap))
+    market = fetch_market_context(asset, fear_greed=fear_greed)
+    text = format_snapshot_message(snap, previous=previous, market=market)
+    save_previous(asset, trackable_fields(snap, market=market))
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -81,8 +85,10 @@ async def cmd_eth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_both(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_asset(update, "BTC")
-    await _send_asset(update, "ETH")
+    # Fear & Greed общий для рынка — получаем один раз на оба актива.
+    fear_greed = fetch_fear_greed()
+    await _send_asset(update, "BTC", fear_greed=fear_greed)
+    await _send_asset(update, "ETH", fear_greed=fear_greed)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
