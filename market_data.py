@@ -1,7 +1,8 @@
 """
 Объединяет дополнительные (не cryptogamma.io) источники в один контекст:
     - технический анализ по Binance (RSI, EMA20/50)
-    - funding rate и open interest по бессрочным фьючерсам Binance
+    - funding rate, open interest и объём по бессрочным фьючерсам Binance
+    - крупные («китовые») сделки по фьючерсам
     - Crypto Fear & Greed Index
 
 Каждый источник независим: если один недоступен, остальные всё равно
@@ -14,7 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from binance_client import fetch_funding_rate, fetch_open_interest, fetch_technicals
+from binance_client import (
+    fetch_funding_rate,
+    fetch_futures_volume_24h,
+    fetch_open_interest,
+    fetch_technicals,
+    fetch_whale_trades,
+)
 from feargreed_client import fetch_fear_greed
 
 
@@ -26,6 +33,12 @@ class MarketContext:
     ema50: Optional[float] = None
     funding_rate_pct: Optional[float] = None
     open_interest: Optional[float] = None
+    futures_volume_24h: Optional[float] = None
+    whale_trade_count: int = 0
+    whale_buy_notional: float = 0.0
+    whale_sell_notional: float = 0.0
+    whale_sample_size: int = 0
+    whale_threshold_usd: float = 0.0
     fear_greed_value: Optional[int] = None
     fear_greed_class: Optional[str] = None
 
@@ -42,6 +55,8 @@ def fetch_market_context(
     tech = fetch_technicals(asset)
     funding = fetch_funding_rate(asset)
     oi = fetch_open_interest(asset)
+    volume = fetch_futures_volume_24h(asset)
+    whales = fetch_whale_trades(asset)
 
     if fear_greed is None:
         fear_greed = fetch_fear_greed()
@@ -54,6 +69,12 @@ def fetch_market_context(
         ema50=tech.ema50,
         funding_rate_pct=funding,
         open_interest=oi,
+        futures_volume_24h=volume,
+        whale_trade_count=whales.count,
+        whale_buy_notional=whales.buy_notional,
+        whale_sell_notional=whales.sell_notional,
+        whale_sample_size=whales.sample_size,
+        whale_threshold_usd=whales.threshold_usd,
         fear_greed_value=fg_value,
         fear_greed_class=fg_class,
     )

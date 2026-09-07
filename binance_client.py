@@ -3,15 +3,19 @@
     - Spot klines (свечи) — для расчёта RSI и EMA
     - Futures premiumIndex — funding rate по перпетуалам
     - Futures openInterest — открытый интерес по перпетуалам
+    - Futures aggTrades — детекция крупных («китовых») сделок
+    - Futures 24hr ticker — объём торгов за 24ч (для OI/Volume ratio)
 
-Все функции возвращают None на отдельных полях при сбое сети/парсинга,
-а не бросают исключение наружу — эти данные дополняют сигнал
-cryptogamma.io, и их временная недоступность не должна ронять весь бот.
+Все функции возвращают None (или пустой dataclass) на отдельных полях
+при сбое сети/парсинга, а не бросают исключение наружу — эти данные
+дополняют сигнал cryptogamma.io, и их временная недоступность не должна
+ронять весь бот.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -25,6 +29,25 @@ USER_AGENT = "cryptogamma-tg-bot/1.0"
 TIMEOUT = 10
 
 SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
+
+# Порог notional (в USD) одной сделки, чтобы считать её «китовой».
+# Публичный API Binance не сообщает тип счёта контрагента — это чисто
+# эвристический порог по размеру сделки, а не подтверждённая
+# принадлежность институциональному игроку. Можно переопределить через
+# переменные окружения WHALE_THRESHOLD_BTC_USD / WHALE_THRESHOLD_ETH_USD.
+_DEFAULT_WHALE_THRESHOLD_USD = {"BTC": 500_000.0, "ETH": 200_000.0}
+
+
+def _whale_threshold(asset: str) -> float:
+    asset = asset.upper()
+    env_key = f"WHALE_THRESHOLD_{asset}_USD"
+    override = os.environ.get(env_key)
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            logger.warning("Некорректное значение %s=%s, использую значение по умолчанию", env_key, override)
+    return _DEFAULT_WHALE_THRESHOLD_USD.get(asset, 250_000.0)
 
 
 def _symbol(asset: str) -> str:
@@ -140,3 +163,87 @@ def fetch_open_interest(asset: str) -> Optional[float]:
     except (requests.RequestException, ValueError, KeyError) as exc:
         logger.warning("Не удалось получить open interest Binance для %s: %s", asset, exc)
         return None
+
+
+def fetch_futures_volume_24h(asset: str) -> Optional[float]:
+    """Объём торгов по бессрочному фьючерсу за 24ч, в USDT (quoteVolume)."""
+    try:
+        symbol = _symbol(asset)
+        resp = requests.get(
+            f"{FUTURES_BASE}/fapi/v1/ticker/24hr",
+            params={"symbol": symbol},
+            headers={"User-Agent": USER_AGENT},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        vol = data.get("quoteVolume")
+        return float(vol) if vol is not None else None
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        logger.warning("Не удалось получить объём Binance Futures для %s: %s", asset, exc)
+        return None
+
+
+@dataclass
+class WhaleActivity:
+    """Сводка по крупным сделкам за выборку последних aggTrades.
+
+    Это эвристический прокси-показатель «институционального» интереса:
+    публичный Binance API не сообщает тип контрагента (розница/фонд/
+    маркет-мейкер), только размер сделки. Крупная сделка — признак
+    крупного капитала, но не подтверждённый факт институционального
+    происхождения.
+    """
+
+    count: int = 0
+    buy_notional: float = 0.0
+    sell_notional: float = 0.0
+    sample_size: int = 0
+    threshold_usd: float = 0.0
+
+
+def fetch_whale_trades(asset: str, limit: int = 1000) -> WhaleActivity:
+    """Сканирует последние `limit` сделок по бессрочному фьючерсу и находит
+    те, чей notional (цена × количество) превышает порог для актива.
+
+    `limit=1000` — это количество последних сделок, а не фиксированный
+    временной интервал: при высокой активности рынка окно может
+    покрывать всего несколько минут, при низкой — куда больше.
+    """
+    try:
+        symbol = _symbol(asset)
+        threshold = _whale_threshold(asset)
+        resp = requests.get(
+            f"{FUTURES_BASE}/fapi/v1/aggTrades",
+            params={"symbol": symbol, "limit": limit},
+            headers={"User-Agent": USER_AGENT},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        trades = resp.json()
+
+        buy_notional = 0.0
+        sell_notional = 0.0
+        count = 0
+        for t in trades:
+            notional = float(t["p"]) * float(t["q"])
+            if notional < threshold:
+                continue
+            count += 1
+            # m=True: покупатель был мейкером => сделку инициировал
+            # продавец (агрессивная продажа). m=False: инициатор — покупатель.
+            if t.get("m"):
+                sell_notional += notional
+            else:
+                buy_notional += notional
+
+        return WhaleActivity(
+            count=count,
+            buy_notional=buy_notional,
+            sell_notional=sell_notional,
+            sample_size=len(trades),
+            threshold_usd=threshold,
+        )
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        logger.warning("Не удалось получить крупные сделки Binance для %s: %s", asset, exc)
+        return WhaleActivity()

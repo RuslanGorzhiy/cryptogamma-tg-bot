@@ -92,7 +92,7 @@ def main() -> int:
             # Сохраняем состояние сразу после успешного получения данных —
             # даже если отправка в Telegram ниже не удастся, динамика
             # между снимками не потеряется на следующем запуске.
-            save_previous(asset, trackable_fields(snap, market=market))
+            save_previous(asset, trackable_fields(snap, market=market, previous=previous))
             send_telegram_message(token, chat_id, text)
             logger.info("Отправлен алерт по %s", asset)
         except CryptoGammaError as exc:

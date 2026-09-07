@@ -71,7 +71,7 @@ async def _send_asset(update: Update, asset: str, fear_greed=None) -> None:
     previous = load_previous(asset)
     market = fetch_market_context(asset, fear_greed=fear_greed)
     text = format_snapshot_message(snap, previous=previous, market=market)
-    save_previous(asset, trackable_fields(snap, market=market))
+    save_previous(asset, trackable_fields(snap, market=market, previous=previous))
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 

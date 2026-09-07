@@ -98,6 +98,107 @@ def derive_confidence(snap: GammaSnapshot) -> Tuple[str, str]:
     return "низкая", f"высокая премия волатильности ({premium:+.1f}%) — рынок ждёт заметное движение"
 
 
+@dataclass
+class InstitutionalInterest:
+    """M-Levels: собственная эвристическая оценка «уровня институционального
+    интереса» — не направление (бычий/медвежий), а масштаб активности
+    крупного капитала прямо сейчас.
+
+    ВАЖНО: публичные API (Binance и др.) не сообщают тип контрагента —
+    невозможно достоверно отличить институционального игрока от очень
+    крупного розничного трейдера. M-Levels — это прокси-метрика по
+    размеру и характеру активности (крупные сделки, аномальный OI,
+    соотношение OI/объём), а не подтверждённый факт присутствия фондов.
+    """
+
+    label: str        # "Низкий" / "Умеренный" / "Высокий" / "Экстремальный"
+    score: float        # 0-100
+    reasons: List[str] = field(default_factory=list)
+
+
+def derive_institutional_interest(
+    snap: GammaSnapshot,
+    market: Optional[MarketContext],
+    previous: Optional[dict] = None,
+) -> InstitutionalInterest:
+    """Считает M-Levels из трёх независимых компонентов величины (magnitude),
+    каждый нормализован в диапазон 0..1, итог — среднее по доступным:
+
+        1. OI относительно своей же скользящей базовой линии (история в
+           state/last_snapshot.json) — резкое отклонение от «нормального»
+           размера открытого интереса в любую сторону.
+        2. OI / объём за 24ч — высокое отношение означает, что позиции
+           держат дольше (типично для институционального/позиционного
+           капитала), а не скальпируют как ритейл.
+        3. Крупные сделки (whale trades) — количество сделок на Binance
+           Futures выше порога за последнюю выборку трейдов.
+    """
+    if not market:
+        return InstitutionalInterest(label="н/д", score=0.0, reasons=["Нет данных Binance для расчёта"])
+
+    components: List[float] = []
+    reasons: List[str] = []
+
+    # 1. OI относительно базовой линии.
+    history = list((previous or {}).get("oi_history", []))
+    if market.open_interest is not None and len(history) >= 3:
+        baseline = sum(history) / len(history)
+        if baseline > 0:
+            ratio = market.open_interest / baseline
+            magnitude = max(0.0, min(1.0, abs(ratio - 1.0)))
+            components.append(magnitude)
+            if ratio >= 1.1:
+                reasons.append(f"OI на {(ratio - 1) * 100:.0f}% выше среднего за последние снимки")
+            elif ratio <= 0.9:
+                reasons.append(f"OI на {(1 - ratio) * 100:.0f}% ниже среднего за последние снимки")
+
+    # 2. OI / объём за 24ч (в долларовом выражении).
+    if market.open_interest is not None and market.futures_volume_24h:
+        oi_volume_ratio = market.open_interest * (snap.price or market.binance_price or 0) / market.futures_volume_24h
+        if oi_volume_ratio > 0:
+            # Диапазон 0.15–0.60 подобран под типичные значения для BTC/ETH
+            # бессрочных фьючерсов (в отличие от акций, где ratio обычно
+            # намного ниже) — это грубая калибровка, не точная константа,
+            # и её стоит уточнить по факту наблюдаемых значений на реальных
+            # прогонах.
+            magnitude = max(0.0, min(1.0, (oi_volume_ratio - 0.15) / (0.60 - 0.15)))
+            components.append(magnitude)
+            if oi_volume_ratio >= 0.45:
+                reasons.append(f"OI/Volume {oi_volume_ratio:.2f} — позиции держат дольше обычного")
+            elif oi_volume_ratio <= 0.20:
+                reasons.append(f"OI/Volume {oi_volume_ratio:.2f} — рынком движет активный ритейл-скальпинг")
+
+    # 3. Крупные сделки.
+    if market.whale_sample_size > 0:
+        magnitude = max(0.0, min(1.0, market.whale_trade_count / 5))
+        components.append(magnitude)
+        if market.whale_trade_count > 0:
+            total_notional = market.whale_buy_notional + market.whale_sell_notional
+            reasons.append(
+                f"{market.whale_trade_count} крупных сделок на ${total_notional:,.0f} "
+                f"за последние ~{market.whale_sample_size} трейдов (порог ${market.whale_threshold_usd:,.0f})"
+            )
+
+    if not components:
+        return InstitutionalInterest(label="н/д", score=0.0, reasons=["Недостаточно данных для M-Levels"])
+
+    score = 100.0 * sum(components) / len(components)
+
+    if score >= 75:
+        label = "Экстремальный"
+    elif score >= 50:
+        label = "Высокий"
+    elif score >= 25:
+        label = "Умеренный"
+    else:
+        label = "Низкий"
+
+    if not reasons:
+        reasons.append("Активность крупного капитала в пределах обычных значений")
+
+    return InstitutionalInterest(label=label, score=score, reasons=reasons)
+
+
 # Веса компонентов итогового сигнала. Каждый компонент даёт вклад от -1
 # до +1 (положительное = бычий фактор), итоговый score — взвешенная сумма.
 _WEIGHTS = {
@@ -114,17 +215,32 @@ _WEIGHTS = {
     "funding_rate": 1.0,
     "open_interest": 1.5,
     "fear_greed": 1.0,
+    "whale_flow": 1.0,
 }
 
 
-def trackable_fields(snap: GammaSnapshot, market: Optional[MarketContext] = None) -> dict:
+OI_HISTORY_LEN = 20  # сколько последних значений OI хранить для базовой линии M-Levels
+
+
+def trackable_fields(
+    snap: GammaSnapshot,
+    market: Optional[MarketContext] = None,
+    previous: Optional[dict] = None,
+) -> dict:
     """Небольшой словарь ключевых метрик снимка для сохранения между запусками.
 
     Используется state_store.py, чтобы на следующем запуске можно было
     посчитать дельту/разворот метрик, а не оценивать сигнал по одной
     изолированной точке. Если передан MarketContext, дополнительно
-    сохраняется open interest — нужен для матрицы «цена × OI».
+    сохраняется open interest и продлевается скользящая история OI
+    (нужна derive_institutional_interest для базовой линии «нормального»
+    размера открытого интереса).
     """
+    history = list((previous or {}).get("oi_history", []))
+    if market and market.open_interest is not None:
+        history.append(market.open_interest)
+        history = history[-OI_HISTORY_LEN:]
+
     return {
         "price": snap.price,
         "net_gamma": snap.net_gamma,
@@ -135,6 +251,7 @@ def trackable_fields(snap: GammaSnapshot, market: Optional[MarketContext] = None
         "vol_premium": snap.vol_premium,
         "updated_at": snap.updated_at,
         "open_interest": market.open_interest if market else None,
+        "oi_history": history,
     }
 
 
@@ -352,6 +469,24 @@ def derive_overall_signal(
             reasons.append(f"Fear & Greed {fg} ({market.fear_greed_class}) — потенциал разворота от страха")
         max_possible += _WEIGHTS["fear_greed"]
 
+    # 12. Направление флоу крупных сделок (whale trades) на Binance Futures.
+    if market and market.whale_trade_count > 0:
+        total_whale = market.whale_buy_notional + market.whale_sell_notional
+        if total_whale > 0:
+            imbalance = (market.whale_buy_notional - market.whale_sell_notional) / total_whale
+            score += _WEIGHTS["whale_flow"] * imbalance
+            if imbalance > 0.15:
+                reasons.append(
+                    f"Крупные сделки смещены в сторону покупок "
+                    f"({market.whale_trade_count} сделок ≥${market.whale_threshold_usd:,.0f})"
+                )
+            elif imbalance < -0.15:
+                reasons.append(
+                    f"Крупные сделки смещены в сторону продаж "
+                    f"({market.whale_trade_count} сделок ≥${market.whale_threshold_usd:,.0f})"
+                )
+            max_possible += _WEIGHTS["whale_flow"]
+
     if max_possible == 0:
         confidence, confidence_note = derive_confidence(snap)
         return OverallSignal(
@@ -396,6 +531,7 @@ def format_snapshot_message(
     market: Optional[MarketContext] = None,
 ) -> str:
     overall = derive_overall_signal(snap, previous=previous, market=market)
+    m_levels = derive_institutional_interest(snap, market, previous=previous)
     bias_emoji = derive_bias_emoji(snap)
 
     lines = [
@@ -450,6 +586,14 @@ def format_snapshot_message(
             lines.append(f"  Open Interest: {_fmt_num(market.open_interest)}")
         if market.fear_greed_value is not None:
             lines.append(f"  Fear & Greed: {market.fear_greed_value} ({market.fear_greed_class or 'н/д'})")
+
+    if m_levels.label != "н/д":
+        m_emoji = {"Низкий": "🔹", "Умеренный": "🔸", "Высокий": "🟠", "Экстремальный": "🔴"}.get(m_levels.label, "🔹")
+        lines += [
+            "",
+            f"<b>{m_emoji} M-Levels — институциональный интерес: {m_levels.label}</b> ({m_levels.score:.0f}/100)",
+            "<i>" + "; ".join(m_levels.reasons) + "</i>",
+        ]
 
     if snap.updated_at:
         lines += ["", f"<i>Обновлено: {snap.updated_at}</i>"]
