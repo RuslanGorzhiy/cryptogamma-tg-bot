@@ -8,7 +8,7 @@
     "realized_vol": null,
     "vol_premium": null,
     "updated_at": null,
-    "open_interest": 97772.492,
+    "open_interest": null,
     "oi_history": [
       97772.492
     ]
@@ -22,7 +22,7 @@
     "realized_vol": null,
     "vol_premium": null,
     "updated_at": null,
-    "open_interest": 2310161.084,
+    "open_interest": null,
     "oi_history": [
       2349616.885,
       2310161.084
