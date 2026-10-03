@@ -8,8 +8,10 @@
     "realized_vol": null,
     "vol_premium": null,
     "updated_at": null,
-    "open_interest": null,
-    "oi_history": []
+    "open_interest": 97772.492,
+    "oi_history": [
+      97772.492
+    ]
   },
   "ETH": {
     "price": null,
@@ -20,9 +22,10 @@
     "realized_vol": null,
     "vol_premium": null,
     "updated_at": null,
-    "open_interest": null,
+    "open_interest": 2310161.084,
     "oi_history": [
-      2349616.885
+      2349616.885,
+      2310161.084
     ]
   }
 }
